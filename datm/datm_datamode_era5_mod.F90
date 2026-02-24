@@ -1,6 +1,7 @@
 module datm_datamode_era5_mod
 
   use ESMF             , only : ESMF_State, ESMF_SUCCESS, ESMF_LogWrite, ESMF_LOGMSG_INFO
+  use ESMF             , only : ESMF_MeshGet
   use NUOPC            , only : NUOPC_Advertise
   use shr_kind_mod     , only : r8=>shr_kind_r8, i8=>shr_kind_i8, cl=>shr_kind_cl, cs=>shr_kind_cs
   use shr_precip_mod   , only : shr_precip_partition_rain_snow_ramp
@@ -69,6 +70,10 @@ module datm_datamode_era5_mod
   real(r8) :: lwmax ! units detector
   real(r8) :: precmax ! units detector
 
+  !------ lat for albedo calc -----
+  real(R8), pointer :: yc(:)                 ! array of model latitudes
+  real(R8) , parameter :: degtorad = SHR_CONST_PI/180.0_R8
+  
   real(r8) , parameter :: tKFrz    = SHR_CONST_TKFRZ
   real(r8) , parameter :: rdair    = SHR_CONST_RDAIR ! dry air gas constant ~ J/K/kg
   real(r8) , parameter :: rhofw    = SHR_CONST_RHOFW ! density of fresh water ~ kg/m^3
@@ -147,12 +152,29 @@ contains
     type(ESMF_State)       , intent(inout) :: exportState
     type(shr_strdata_type) , intent(in)    :: sdat
     integer                , intent(out)   :: rc
+   
+    !---- variables assocaited with mesh (local) needed for albedo calc 
+    integer           :: n
+    integer           :: spatialDim         ! number of dimension in mesh
+    integer           :: numOwnedElements   ! size of mesh
+    real(r8), pointer :: ownedElemCoords(:) ! mesh lat and lons   
 
     ! local variables
     character(len=*), parameter :: subname='(datm_init_pointers): '
     !-------------------------------------------------------------------------------
 
     rc = ESMF_SUCCESS
+
+
+    call ESMF_MeshGet(sdat%model_mesh, spatialDim=spatialDim, numOwnedElements=numOwnedElements, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    allocate(ownedElemCoords(spatialDim*numOwnedElements))
+    allocate(yc(numOwnedElements))
+    call ESMF_MeshGet(sdat%model_mesh, ownedElemCoords=ownedElemCoords)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    do n = 1,numOwnedElements
+         yc(n) = ownedElemCoords(2*n)
+    end do
 
     ! initialize pointers for module level stream arrays
     call shr_strdata_get_stream_pointer(sdat, 'Sa_z'      , strm_z   , rc)
@@ -261,6 +283,11 @@ contains
     real(r8) :: rtmp(2)
     real(r8) :: tbot, pbot
     real(r8) :: e, qsat
+
+    real(R8)          :: avg_alb            ! average albedo
+    real(R8)          :: cosFactor          ! cosine factor
+
+
     type(ESMF_VM) :: vm
     character(len=*), parameter :: subname='(datm_datamode_era5_advance): '
     !-------------------------------------------------------------------------------
@@ -384,10 +411,27 @@ contains
 
     !--- shortwave radiation (Faxa_* basically holds albedo) ---
     !--- see comments for Faxa_swnet
-    if (associated(Faxa_swvdr)) Faxa_swvdr(:) = Faxa_swdn(:)*Faxa_swvdr(:)
-    if (associated(Faxa_swndr)) Faxa_swndr(:) = Faxa_swdn(:)*Faxa_swndr(:)
-    if (associated(Faxa_swvdf)) Faxa_swvdf(:) = Faxa_swdn(:)*Faxa_swvdf(:)
-    if (associated(Faxa_swndf)) Faxa_swndf(:) = Faxa_swdn(:)*Faxa_swndf(:)
+       ! Split incoming doward radiation into individual bands (CICE coupling)
+       ! adapted from JRA data mode (there is also albedo modifation there)
+
+       if (associated(Faxa_swdn)) then
+            do n = 1, lsize
+               if (associated(Faxa_swvdr))  Faxa_swvdr(n) = Faxa_swdn(n)*(0.28_R8)
+               if (associated(Faxa_swndr))  Faxa_swndr(n) = Faxa_swdn(n)*(0.31_R8)
+               if (associated(Faxa_swvdf))  Faxa_swvdf(n) = Faxa_swdn(n)*(0.24_R8)
+               if (associated(Faxa_swndf))  Faxa_swndf(n) = Faxa_swdn(n)*(0.17_R8)
+               if (associated(Faxa_swnet)) then
+                  Faxa_swnet(n) = (Faxa_swvdr(n) + Faxa_swndr(n) + Faxa_swvdf(n) + Faxa_swndf(n))
+                  avg_alb = ( 0.069 - 0.011*cos(2.0_R8*yc(n)*degtorad ) )
+                  Faxa_swnet(n) = (Faxa_swnet(n))*(1.0_R8)! - 0.1_R8)!avg_alb)
+               endif
+            enddo
+      ! else
+      !    if (associated(Faxa_swvdr)) Faxa_swvdr(:) = Faxa_swdn(:)*Faxa_swvdr(:)
+      !    if (associated(Faxa_swndr)) Faxa_swndr(:) = Faxa_swdn(:)*Faxa_swndr(:)
+      !    if (associated(Faxa_swvdf)) Faxa_swvdf(:) = Faxa_swdn(:)*Faxa_swvdf(:)
+      !    if (associated(Faxa_swndf)) Faxa_swndf(:) = Faxa_swdn(:)*Faxa_swndf(:)
+       endif
 
     !--- TODO: need to understand relationship between shortwave bands and
     !--- net shortwave rad. currently it is provided directly from ERA5
